@@ -33,7 +33,7 @@ const FALLBACK_SIGMA = 0.15;
 const MIN_SIGMA = 0.05;
 
 interface HourPoint { from: string; viewers: number }
-interface Comparable { day_start: string; hourly: HourPoint[] }
+interface Comparable { day_start: string; unlock?: string; hourly: HourPoint[] }
 interface CaseFile {
   levels: number[];
   known: Array<{ hour: number; viewers: number }>;
@@ -43,15 +43,37 @@ interface CaseFile {
 
 const round2 = (x: number): number => Math.round(x * 100) / 100;
 
-/** The value at position q (0..1) of a sorted array, linearly interpolated. */
-function quantileOf(sorted: number[], q: number): number {
-  if (sorted.length === 0) return 0;
-  if (sorted.length === 1) return sorted[0];
-  const pos = q * (sorted.length - 1);
-  const lo = Math.floor(pos);
-  const hi = Math.ceil(pos);
-  if (lo === hi) return sorted[lo];
-  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+/** One pooled vote: a log-ratio and the weight its comparable carries. */
+interface Vote { v: number; w: number }
+
+/** The weighted value at position q (0..1) of a pool sorted by value. */
+function quantileOf(pool: Vote[], q: number): number {
+  if (pool.length === 0) return 0;
+  if (pool.length === 1) return pool[0].v;
+  const total = pool.reduce((s, x) => s + x.w, 0);
+  const target = q * total;
+  let acc = 0;
+  for (let i = 0; i < pool.length; i++) {
+    acc += pool[i].w;
+    if (acc >= target) {
+      if (i === 0) return pool[0].v;
+      const prevAcc = acc - pool[i].w;
+      const span = pool[i].w === 0 ? 1 : pool[i].w;
+      const frac = Math.min(1, Math.max(0, (target - prevAcc) / span));
+      return pool[i - 1].v + (pool[i].v - pool[i - 1].v) * frac;
+    }
+  }
+  return pool[pool.length - 1].v;
+}
+
+/**
+ * How much a comparable's curve should count. GTA VI unlocks at midnight
+ * local time, rolling across regions, so a comparable that unlocked the same
+ * way carries a full vote; one with a single global unlock time carries half.
+ */
+function weightOf(comp: Comparable): number {
+  const text = (comp.unlock ?? '').toLowerCase();
+  return text.includes('midnight') || text.includes('rolling') ? 1 : 0.5;
 }
 
 /**
@@ -72,27 +94,28 @@ function dayCurve(comp: Comparable): Map<number, number> {
  * Pools of log-ratios per forecast hour: for hour H (2..24), the values
  * log(curve[H-1] / curve[0]) over every comparable that has both hours.
  */
-function ratioPools(comparables: Comparable[]): Map<number, number[]> {
-  const pools = new Map<number, number[]>();
+function ratioPools(comparables: Comparable[]): Map<number, Vote[]> {
+  const pools = new Map<number, Vote[]>();
   for (const comp of comparables) {
     const curve = dayCurve(comp);
     const base = curve.get(0);
     if (base === undefined || base <= 0) continue;
+    const w = weightOf(comp);
     for (let idx = 1; idx < 24; idx++) {
       const v = curve.get(idx);
       if (v === undefined || v <= 0) continue;
       const hour = idx + 1;
       const pool = pools.get(hour) ?? [];
-      pool.push(Math.log(v / base));
+      pool.push({ v: Math.log(v / base), w });
       pools.set(hour, pool);
     }
   }
-  for (const pool of pools.values()) pool.sort((a, b) => a - b);
+  for (const pool of pools.values()) pool.sort((a, b) => a.v - b.v);
   return pools;
 }
 
 /** The five quantiles of one forecast hour, in viewers. */
-function hourQuantiles(p1: number, hour: number, pool: number[] | undefined): number[] {
+function hourQuantiles(p1: number, hour: number, pool: Vote[] | undefined): number[] {
   let centre: number;
   let sigma: number;
   if (pool !== undefined && pool.length >= 8) {
