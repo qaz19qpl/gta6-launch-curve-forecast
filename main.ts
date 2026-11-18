@@ -33,7 +33,7 @@ const FALLBACK_SIGMA = 0.15;
 const MIN_SIGMA = 0.05;
 
 interface HourPoint { from: string; viewers: number }
-interface Comparable { day_start: string; unlock?: string; hourly: HourPoint[] }
+interface Comparable { day_start: string; unlock?: string; platforms?: string; hourly: HourPoint[] }
 interface CaseFile {
   levels: number[];
   known: Array<{ hour: number; viewers: number }>;
@@ -73,7 +73,17 @@ function quantileOf(pool: Vote[], q: number): number {
  */
 function weightOf(comp: Comparable): number {
   const text = (comp.unlock ?? '').toLowerCase();
-  return text.includes('midnight') || text.includes('rolling') ? 1 : 0.5;
+  let w = text.includes('midnight') || text.includes('rolling') ? 1 : 0.5;
+  // Twitch's audience and the shape of a launch day have drifted over the
+  // years; a recent launch's curve says more about a 2026 launch than a
+  // decade-old one does.
+  const year = Number((comp.day_start ?? '').slice(0, 4));
+  if (Number.isFinite(year)) w *= year >= 2023 ? 1 : year >= 2020 ? 0.75 : 0.55;
+  // GTA VI is console-first; a launch that also shipped on PC the same day
+  // front-loads its curve differently, so it counts for less.
+  const platforms = (comp.platforms ?? '').toLowerCase();
+  if (platforms.includes('pc') && !platforms.includes('console')) w *= 0.6;
+  return w;
 }
 
 /**
@@ -110,8 +120,19 @@ function ratioPools(comparables: Comparable[]): Map<number, Vote[]> {
       pools.set(hour, pool);
     }
   }
-  for (const pool of pools.values()) pool.sort((a, b) => a.v - b.v);
-  return pools;
+  // Smooth each hour's pool with its neighbours': an hour's ratio is noisy
+  // across only a few dozen launches, and the true curve moves slowly, so
+  // the hours either side lend their votes at a discount.
+  const smoothed = new Map<number, Vote[]>();
+  for (let hour = 2; hour <= 24; hour++) {
+    const pool: Vote[] = [];
+    for (const [h, w] of [[hour - 1, 0.35], [hour, 1], [hour + 1, 0.35]] as const) {
+      for (const vote of pools.get(h) ?? []) pool.push({ v: vote.v, w: vote.w * w });
+    }
+    pool.sort((a, b) => a.v - b.v);
+    smoothed.set(hour, pool);
+  }
+  return smoothed;
 }
 
 /** The five quantiles of one forecast hour, in viewers. */
